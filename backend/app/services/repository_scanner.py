@@ -1,4 +1,4 @@
-import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,80 +11,106 @@ SUPPORTED_EXTENSIONS = {
     ".jsx": "javascript",
 }
 
-IGNORED_DIRECTORIES = {
-    ".git",
+EXCLUDED_DIRECTORIES = {
+    "node_modules",
     ".venv",
     "venv",
-    "node_modules",
     "dist",
     "build",
     "__pycache__",
-    ".next",
 }
 
-MAX_FILE_BYTES = 200_000
+MAX_FILE_SIZE = 200_000
 MAX_FILES = 500
 
 
-@dataclass
+@dataclass(frozen=True)
 class SourceFile:
     path: str
     language: str
     content: str
+    size_bytes: int
 
 
-def scan_repository(root: Path) -> list[SourceFile]:
-    """Scan a trusted local repository for supported source files."""
+def scan_repository(repo_root: Path) -> list[SourceFile]:
+    """Read supported, Git-tracked source files."""
 
-    if root.is_symlink() or not root.is_dir():
-        raise ValueError("Repository must be an existing directory")
+    if repo_root.is_symlink() or not repo_root.is_dir():
+        raise ValueError("Invalid repository directory")
 
-    root = root.resolve()
-    results = []
+    root = repo_root.resolve()
 
-    for current_dir, directories, filenames in os.walk(
-        root,
-        followlinks=False,
-    ):
-        directories[:] = sorted(
-            directory
-            for directory in directories
-            if directory not in IGNORED_DIRECTORIES
-            and not directory.startswith(".")
-            and not (Path(current_dir) / directory).is_symlink()
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+            ],
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+    ) as exc:
+        raise ValueError("Cannot list Git-tracked files") from exc
+
+    tracked_files = result.stdout.decode(
+        "utf-8",
+        errors="surrogateescape",
+    ).split("\0")
+
+    source_files = []
+
+    for relative_path in sorted(filter(None, tracked_files)):
+        relative = Path(relative_path)
+
+        if any(
+            part.startswith(".") or part in EXCLUDED_DIRECTORIES
+            for part in relative.parts
+        ):
+            continue
+
+        language = SUPPORTED_EXTENSIONS.get(relative.suffix)
+
+        if language is None:
+            continue
+
+        file_path = root / relative
+
+        if file_path.is_symlink() or not file_path.is_file():
+            continue
+
+        if not file_path.resolve().is_relative_to(root):
+            continue
+
+        try:
+            size = file_path.stat().st_size
+
+            if size > MAX_FILE_SIZE:
+                continue
+
+            content = file_path.read_text(encoding="utf-8")
+
+        except (OSError, UnicodeError):
+            continue
+
+        if len(source_files) >= MAX_FILES:
+            raise ValueError("Repository file limit exceeded")
+
+        source_files.append(
+            SourceFile(
+                path=relative.as_posix(),
+                language=language,
+                content=content,
+                size_bytes=size,
+            )
         )
 
-        for filename in sorted(filenames):
-            if filename.startswith("."):
-                continue
-
-            file_path = Path(current_dir) / filename
-
-            if file_path.is_symlink():
-                continue
-
-            language = SUPPORTED_EXTENSIONS.get(file_path.suffix)
-
-            if language is None:
-                continue
-
-            if file_path.stat().st_size > MAX_FILE_BYTES:
-                continue
-
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except (UnicodeError, OSError):
-                continue
-
-            if len(results) >= MAX_FILES:
-                raise ValueError("Repository exceeds the file limit")
-
-            results.append(
-                SourceFile(
-                    path=file_path.relative_to(root).as_posix(),
-                    language=language,
-                    content=content,
-                )
-            )
-
-    return sorted(results, key=lambda file: file.path)
+    return source_files

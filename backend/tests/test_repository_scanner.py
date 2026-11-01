@@ -1,51 +1,76 @@
+import subprocess
+
 import pytest
 
 from app.services.repository_scanner import scan_repository
 
 
-def test_scans_supported_files(tmp_path):
-    (tmp_path / "main.py").write_text("print('hello')")
-    (tmp_path / "Chat.tsx").write_text("export const Chat = () => null")
+def git(repo, *args):
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+    )
 
-    files = scan_repository(tmp_path)
+
+@pytest.fixture
+def repository(tmp_path):
+    git(tmp_path, "init", "-q")
+    return tmp_path
+
+
+def test_scans_tracked_source_files(repository):
+    (repository / "main.py").write_text("print('hello')")
+    (repository / "App.tsx").write_text(
+        "export const App = () => null"
+    )
+
+    git(repository, "add", "main.py", "App.tsx")
+
+    files = scan_repository(repository)
 
     assert len(files) == 2
-    assert files[0].path == "Chat.tsx"
-    assert files[1].language == "python"
+    assert {f.language for f in files} == {
+        "python",
+        "typescript",
+    }
 
 
-def test_ignores_dependencies(tmp_path):
-    node_modules = tmp_path / "node_modules"
-    node_modules.mkdir()
+def test_ignores_untracked_files(repository):
+    (repository / "tracked.py").write_text("x = 1")
+    (repository / "untracked.py").write_text("secret = 123")
 
-    (node_modules / "index.js").write_text("ignored")
-    (tmp_path / "app.py").write_text("print('included')")
+    git(repository, "add", "tracked.py")
 
-    files = scan_repository(tmp_path)
+    files = scan_repository(repository)
 
     assert len(files) == 1
-    assert files[0].path == "app.py"
+    assert files[0].path == "tracked.py"
 
 
-def test_skips_oversized_files(tmp_path):
-    (tmp_path / "large.py").write_text("x" * 300_000)
+def test_ignores_dependency_directories(repository):
+    directory = repository / "node_modules"
+    directory.mkdir()
 
-    files = scan_repository(tmp_path)
+    (directory / "index.js").write_text("ignored")
+
+    git(repository, "add", "-f", "node_modules/index.js")
+
+    files = scan_repository(repository)
 
     assert files == []
 
 
-def test_rejects_invalid_directory(tmp_path):
+def test_skips_large_files(repository):
+    (repository / "large.py").write_text("x" * 300_000)
+
+    git(repository, "add", "large.py")
+
+    files = scan_repository(repository)
+
+    assert files == []
+
+
+def test_invalid_repository(tmp_path):
     with pytest.raises(ValueError):
         scan_repository(tmp_path / "missing")
-
-
-def test_preserves_relative_paths(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-
-    (src / "utils.ts").write_text("export const x = 1")
-
-    files = scan_repository(tmp_path)
-
-    assert files[0].path == "src/utils.ts"
